@@ -3,7 +3,7 @@ uvicorn
 httpx
 python-telegram-bot==20.8
 chromadb
-sentence-transformers==2.2.2
+sentence-transformers>=3.0.0
 PyPDF2
 python-multipart
 numpy==1.26.4
