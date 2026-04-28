@@ -52,7 +52,7 @@ async def send_telegram_message(chat_id: int, text: str):
     async with httpx.AsyncClient() as client:
         await client.post(url, json={
             "chat_id": chat_id,
-            "text": text,
+            "text": text[:4000],
             "parse_mode": "Markdown"
         }, timeout=30.0)
 
