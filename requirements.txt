@@ -6,5 +6,5 @@ chromadb
 sentence-transformers==2.2.2
 PyPDF2
 python-multipart
-numpy
+numpy==1.26.4
 groq
