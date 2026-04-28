@@ -6,7 +6,7 @@ import os
 import json
 from typing import List, Dict, Any, Optional
 from groq import Groq
-from embedder import get_or_create_collection, COLLECTION_NAME
+from embedder import buscar
 
 # Groq config
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
@@ -85,69 +85,74 @@ def _build_system_prompt() -> str:
     )
 
 
-def query_rag(user_query: str, chat_history: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+def query_rag(user_query: str, chat_history=None):
     """
     Main RAG pipeline.
     Returns: {response, confidence, citations, escalated}
     """
-    collection = get_or_create_collection()
-    
     # 1. Retrieve context
-    results = collection.query(
-        query_texts=[user_query],
-        n_results=TOP_K,
-        include=["documents", "metadatas", "distances"]
+    documentos = buscar(user_query, n_resultados=3)
+    
+    if not documentos:
+        return {
+            "response": "No encontré información relevante en la documentación. Te sugiero consultar con el Jefe de Auditoría.",
+            "confidence": 0.0,
+            "citations": [],
+            "escalated": True
+        }
+    
+    # 2. Build context
+    context_parts = []
+    citations = []
+    for i, doc in enumerate(documentos, 1):
+        context_parts.append(f"[Documento {i}] {doc['fuente']}:\n{doc['texto'][:600]}")
+        citations.append({
+            "doc": doc['fuente'],
+            "chunk": i,
+            "score": doc['relevancia']
+        })
+    
+    context_str = "\n\n---\n\n".join(context_parts)
+    
+    # 3. Compute confidence
+    confidence = sum(d['relevancia'] for d in documentos) / len(documentos)
+    
+    # 4. Build messages
+    system_prompt = (
+        "Sos un Auditor Interno Senior. Respondé basándote ÚNICAMENTE en la documentación proporcionada. "
+        "Cita las fuentes como [Fuente: nombre_documento]. "
+        "Si no tenés información suficiente, indicá que se debe escalar la consulta. "
+        "NUNCA digas que sos una IA. Usá tono profesional y claro."
     )
     
-    context_str, citations = _format_context(results)
-    distances = results.get("distances", [[]])[0]
-    confidence = _compute_confidence(distances)
-    
-    # 2. Build messages
-    system_prompt = _build_system_prompt()
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": f"Contexto documental disponible:\n\n{context_str}\n\n---\n\nConsulta del empleado: {user_query}"}
+        {"role": "user", "content": f"Contexto:\n\n{context_str}\n\n---\n\nConsulta: {user_query}"}
     ]
     
-    # Add brief history if available (last 2 exchanges max)
-    if chat_history:
-        recent = chat_history[:2]
-        for row in reversed(recent):
-            messages.insert(1, {"role": "user", "content": row["user_query"]})
-            messages.insert(2, {"role": "assistant", "content": row["bot_response"]})
-    
-    # 3. Call Groq
+    # 5. Call Groq
     client = _get_groq_client()
     try:
         chat_completion = client.chat.completions.create(
             model=GROQ_MODEL,
             messages=messages,
-            temperature=TEMPERATURE,
-            max_tokens=MAX_TOKENS,
-            top_p=0.9,
+            temperature=0.3,
+            max_tokens=1500
         )
     except Exception as e:
-        # Fallback model
-        print(f"[RAG] Primary model failed ({e}), trying fallback...")
         chat_completion = client.chat.completions.create(
             model=GROQ_FALLBACK_MODEL,
             messages=messages,
-            temperature=TEMPERATURE,
-            max_tokens=MAX_TOKENS,
-            top_p=0.9,
+            temperature=0.3,
+            max_tokens=1500
         )
     
     response_text = chat_completion.choices[0].message.content.strip()
     
-    # 4. Escalation decision
+    # 6. Escalation
     escalated = confidence < CONFIDENCE_THRESHOLD
     if escalated:
-        response_text += (
-            "\n\n⚠️ *Nota interna:* Esta consulta requiere revisión adicional por parte del equipo de Auditoría. "
-            "Se ha generado un ticket de escalamiento para verificación humana. "
-            "Un auditor se pondrá en contacto contigo si es necesario."
-        )
+        response_text += "\n\n⚠️ Esta consulta requiere revisión adicional del equipo de Auditoría."
     
     return {
         "response": response_text,
@@ -156,12 +161,5 @@ def query_rag(user_query: str, chat_history: Optional[List[Dict[str, Any]]] = No
         "escalated": escalated,
         "model_used": chat_completion.model
     }
-
-
-def quick_check_index() -> bool:
-    """Check if the Chroma collection has data."""
-    try:
-        collection = get_or_create_collection()
-        return collection.count() > 0
     except Exception:
         return False
