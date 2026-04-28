@@ -3,20 +3,31 @@ import os
 import logging
 from fastapi import FastAPI, Request
 import httpx
+from groq import Groq
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-import bot as bot_logic
-import database as db
+client = Groq(api_key=GROQ_API_KEY)
 
 app = FastAPI(title="Auditoría Interna Bot")
 
-@app.on_event("startup")
-async def startup_event():
-    logger.info("FastAPI iniciado")
+SYSTEM_PROMPT = """Sos un Auditor Interno Senior con 20 años de experiencia en Auditoría Interna.
+Respondé consultas de empleados del área de Auditoría Interna.
+
+REGLAS ESTRICTAS:
+1. Respondé en español, con tono profesional, claro y paso a paso.
+2. Si la consulta es sobre normativa, procedimientos o controles, explicá detalladamente.
+3. Si no sabés algo con certeza, decí que se debe consultar con el Jefe de Auditoría.
+4. NUNCA digas que sos una IA, un modelo de lenguaje o un bot. Sos parte del equipo de Auditoría Interna.
+5. No inventés datos, montos ni normas específicas que no conozcas.
+6. Si la consulta implica una irregularidad potencial, sé objetivo y orientá al procedimiento formal.
+7. Mantené la confidencialidad.
+
+Para casos concretos, analizá paso a paso: identificá el riesgo, el control, la evidencia necesaria y la conclusión."""
 
 @app.post("/webhook")
 async def webhook(request: Request):
@@ -29,28 +40,46 @@ async def webhook(request: Request):
         message = data["message"]
         chat_id = message["chat"]["id"]
         text = message.get("text", "")
-        username = message["from"].get("username")
-        first_name = message["from"].get("first_name")
-        last_name = message["from"].get("last_name")
         
-        result = await bot_logic.process_message(
-            chat_id=chat_id,
-            text=text,
-            username=username,
-            first_name=first_name,
-            last_name=last_name
-        )
+        # Smalltalk detection
+        smalltalk = ["hola", "buenos días", "buenas tardes", "buenas noches", "hey", "saludos",
+                     "gracias", "muchas gracias", "ok", "okay", "perfecto", "entendido", "dale",
+                     "cómo estás", "qué tal", "todo bien", "/start"]
         
-        await send_telegram_message(chat_id, result["reply_text"])
+        text_lower = text.lower().strip()
+        
+        if any(s in text_lower for s in smalltalk) and len(text) < 60:
+            reply = "Hola, soy del equipo de Auditoría Interna. ¿En qué puedo ayudarte hoy? Podés consultarme sobre normativas, procedimientos o casos concretos."
+            await send_message(chat_id, reply)
+            return {"status": "ok"}
+        
+        # Consulta real -> Groq
+        try:
+            chat_completion = client.chat.completions.create(
+                model="llama3-8b-8192",
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": text}
+                ],
+                temperature=0.3,
+                max_tokens=1500
+            )
+            reply = chat_completion.choices[0].message.content.strip()
+        except Exception as e:
+            logger.error(f"Groq error: {e}")
+            reply = "Disculpá, estoy teniendo dificultades técnicas. Por favor, contactá directamente al equipo de Auditoría."
+        
+        await send_message(chat_id, reply)
         return {"status": "ok"}
+        
     except Exception as e:
-        logger.error(f"Error: {e}")
+        logger.error(f"Webhook error: {e}")
         return {"status": "error"}
 
-async def send_telegram_message(chat_id: int, text: str):
+async def send_message(chat_id: int, text: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    async with httpx.AsyncClient() as client:
-        await client.post(url, json={
+    async with httpx.AsyncClient() as client_http:
+        await client_http.post(url, json={
             "chat_id": chat_id,
             "text": text[:4000],
             "parse_mode": "Markdown"
