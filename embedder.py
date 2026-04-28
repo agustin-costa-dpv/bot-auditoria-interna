@@ -5,7 +5,6 @@ from pathlib import Path
 
 from PyPDF2 import PdfReader
 import chromadb
-from chromadb.config import Settings
 
 CHROMA_PATH = "./chroma_db"
 DOCS_PATH = "./documentos"
@@ -17,10 +16,8 @@ _collection = None
 def get_client():
     global _client
     if _client is None:
-        _client = chromadb.Client(Settings(
-            chroma_db_impl="duckdb+parquet",
-            persist_directory=CHROMA_PATH
-        ))
+        # Nueva forma de crear cliente (Chroma 0.4.x)
+        _client = chromadb.PersistentClient(path=CHROMA_PATH)
     return _client
 
 def get_or_create_collection():
