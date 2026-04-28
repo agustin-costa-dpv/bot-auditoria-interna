@@ -1,7 +1,7 @@
 fastapi
 uvicorn
-python-telegram-bot==20.8
 httpx
+python-telegram-bot==20.8
 chromadb
 sentence-transformers==2.2.2
 PyPDF2
