@@ -1,184 +1,128 @@
-"""
-PDF Embedding & Indexing module.
-Reads PDFs from data/documents/, chunks them, and indexes into ChromaDB.
-"""
-
+# embedder.py
 import os
-import glob
-import hashlib
-from typing import List, Dict, Any
-from pypdf import PdfReader
+import re
+from pathlib import Path
+
+from PyPDF2 import PdfReader
 import chromadb
-from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
+from chromadb.config import Settings
+from sentence_transformers import SentenceTransformer
 
-CHROMA_PATH = os.getenv("CHROMA_PATH", "./chroma_db")
-DOCS_DIR = os.getenv("DOCS_DIR", "./data/documents")
-COLLECTION_NAME = "auditoria"
+# Modelo de embeddings más liviano
+MODEL_NAME = "paraphrase-MiniLM-L3-v2"  # 17MB vs 80MB del anterior
+CHROMA_PATH = "./chroma_db"
+DOCS_PATH = "./documentos"
 
-# Local embedding model (free, runs on CPU, ~80MB)
-EMBED_MODEL = "all-MiniLM-L6-v2"
-
-
-def get_chroma_client() -> chromadb.Client:
-    os.makedirs(CHROMA_PATH, exist_ok=True)
-    return chromadb.PersistentClient(path=CHROMA_PATH)
-
-
-def get_embedding_function():
-    return SentenceTransformerEmbeddingFunction(model_name=EMBED_MODEL)
-
-
-def get_or_create_collection(client: chromadb.Client = None):
-    if client is None:
-        client = get_chroma_client()
-    return client.get_or_create_collection(
-        name=COLLECTION_NAME,
-        embedding_function=get_embedding_function(),
-        metadata={"description": "Normativa e informes de auditoría interna"}
-    )
-
-
-def extract_text_from_pdf(pdf_path: str) -> List[Dict[str, Any]]:
-    """Extract text page by page from a PDF."""
-    reader = PdfReader(pdf_path)
-    pages = []
-    for i, page in enumerate(reader.pages, start=1):
-        text = page.extract_text()
-        if text and text.strip():
-            pages.append({"page": i, "text": text.strip()})
-    return pages
-
-
-def split_text(text: str, chunk_size: int = 1500, chunk_overlap: int = 300) -> List[str]:
-    """Simple recursive-like chunking by paragraphs with overlap."""
-    separators = ["\n\n", "\n", ". ", " "]
-    
-    def _split(t: str, sep_idx: int) -> List[str]:
-        if sep_idx >= len(separators):
-            # last resort: character split
-            chunks = []
-            for i in range(0, len(t), chunk_size - chunk_overlap):
-                chunk = t[i:i + chunk_size]
-                if chunk.strip():
-                    chunks.append(chunk.strip())
-            return chunks
+class DocumentEmbedder:
+    def __init__(self):
+        print("Cargando modelo de embeddings...")
+        self.model = SentenceTransformer(MODEL_NAME)
+        print("Modelo cargado.")
         
-        sep = separators[sep_idx]
-        parts = t.split(sep)
+        self.client = chromadb.Client(Settings(
+            chroma_db_impl="duckdb+parquet",
+            persist_directory=CHROMA_PATH
+        ))
+        self.collection = self.client.get_or_create_collection(
+            name="auditoria_interna",
+            metadata={"hnsw:space": "cosine"}
+        )
+    
+    def extraer_texto_pdf(self, ruta: str) -> str:
+        try:
+            reader = PdfReader(ruta)
+            texto = ""
+            for i, pagina in enumerate(reader.pages):
+                if i > 50:  # Limitar a 50 páginas por PDF
+                    break
+                texto += pagina.extract_text() or ""
+            return texto[:50000]  # Limitar a 50k caracteres
+        except Exception as e:
+            print(f"Error leyendo {ruta}: {e}")
+            return ""
+    
+    def dividir_en_chunks(self, texto: str, tamano: int = 300, solapamiento: int = 50) -> list:
+        oraciones = re.split(r'(?<=[.!?])\s+', texto)
         chunks = []
-        current = ""
+        chunk_actual = ""
         
-        for part in parts:
-            candidate = current + (sep if current else "") + part
-            if len(candidate) <= chunk_size:
-                current = candidate
+        for oracion in oraciones:
+            if len(chunk_actual) + len(oracion) < tamano:
+                chunk_actual += " " + oracion
             else:
-                if current:
-                    chunks.append(current.strip())
-                if len(part) > chunk_size:
-                    # part too big, recurse with next separator
-                    chunks.extend(_split(part, sep_idx + 1))
-                    current = ""
-                else:
-                    current = part
+                if chunk_actual:
+                    chunks.append(chunk_actual.strip())
+                chunk_actual = oracion
         
-        if current.strip():
-            chunks.append(current.strip())
-        return chunks
-    
-    return _split(text, 0)
-
-
-def index_documents(docs_dir: str = None, reset: bool = False) -> Dict[str, Any]:
-    """
-    Index all PDFs from docs_dir into ChromaDB.
-    If reset=True, deletes existing collection and re-indexes everything.
-    """
-    docs_dir = docs_dir or DOCS_DIR
-    if not os.path.isdir(docs_dir):
-        raise FileNotFoundError(f"Documents directory not found: {docs_dir}")
-    
-    client = get_chroma_client()
-    
-    if reset:
-        try:
-            client.delete_collection(COLLECTION_NAME)
-            print(f"[Embeder] Collection '{COLLECTION_NAME}' deleted for reset.")
-        except Exception:
-            pass
-    
-    collection = get_or_create_collection(client)
-    
-    pdf_files = glob.glob(os.path.join(docs_dir, "**/*.pdf"), recursive=True)
-    if not pdf_files:
-        return {"indexed": 0, "chunks": 0, "message": "No PDFs found."}
-    
-    total_chunks = 0
-    indexed_files = 0
-    
-    for pdf_path in sorted(pdf_files):
-        rel_path = os.path.relpath(pdf_path, docs_dir)
-        print(f"[Embeder] Processing: {rel_path}")
+        if chunk_actual:
+            chunks.append(chunk_actual.strip())
         
-        try:
-            pages = extract_text_from_pdf(pdf_path)
-            full_text = "\n\n".join(p["text"] for p in pages)
+        return chunks[:100]  # Limitar a 100 chunks por documento
+    
+    def indexar_documentos(self):
+        documentos = list(Path(DOCS_PATH).rglob("*.pdf"))
+        print(f"Encontrados {len(documentos)} documentos")
+        
+        ids_existentes = set(self.collection.get()["ids"]) if self.collection.count() > 0 else set()
+        
+        for doc in documentos:
+            doc_id = str(doc.relative_to(DOCS_PATH)).replace("/", "_").replace(".pdf", "")
             
-            if not full_text.strip():
-                print(f"[Embeder] Skipping (no text): {rel_path}")
+            if doc_id in ids_existentes:
+                print(f"Ya indexado: {doc_id}")
                 continue
             
-            chunks = split_text(full_text)
-            doc_id_base = hashlib.md5(rel_path.encode()).hexdigest()[:12]
+            texto = self.extraer_texto_pdf(str(doc))
+            if not texto.strip():
+                print(f"Sin texto extraíble: {doc}")
+                continue
             
-            ids = []
-            documents = []
-            metadatas = []
+            chunks = self.dividir_en_chunks(texto)
+            print(f"Indexando {doc.name}: {len(chunks)} chunks")
             
-            for idx, chunk in enumerate(chunks):
-                chunk_id = f"{doc_id_base}_chunk_{idx}"
-                ids.append(chunk_id)
-                documents.append(chunk)
-                metadatas.append({
-                    "source": rel_path,
-                    "page_start": pages[0]["page"] if pages else 1,
-                    "chunk_index": idx,
-                    "total_chunks": len(chunks)
-                })
-            
-            # Upsert in batches to avoid huge single payloads
-            batch_size = 100
-            for i in range(0, len(ids), batch_size):
-                end = i + batch_size
-                collection.upsert(
-                    ids=ids[i:end],
-                    documents=documents[i:end],
-                    metadatas=metadatas[i:end]
+            for i, chunk in enumerate(chunks):
+                chunk_id = f"{doc_id}_chunk_{i}"
+                embedding = self.model.encode(chunk, convert_to_numpy=True).tolist()
+                
+                self.collection.add(
+                    ids=[chunk_id],
+                    embeddings=[embedding],
+                    documents=[chunk],
+                    metadatas=[{
+                        "fuente": str(doc.relative_to(DOCS_PATH)),
+                        "chunk_index": i,
+                        "total_chunks": len(chunks)
+                    }]
                 )
-            
-            total_chunks += len(chunks)
-            indexed_files += 1
-            print(f"[Embeder]  -> {len(chunks)} chunks indexed.")
-            
-        except Exception as e:
-            print(f"[Embeder] ERROR processing {rel_path}: {e}")
+        
+        print("Indexación completada")
     
-    return {
-        "indexed": indexed_files,
-        "chunks": total_chunks,
-        "message": f"Indexed {indexed_files} files ({total_chunks} chunks)."
-    }
+    def buscar(self, consulta: str, n_resultados: int = 3) -> list:
+        embedding = self.model.encode(consulta, convert_to_numpy=True).tolist()
+        resultados = self.collection.query(
+            query_embeddings=[embedding],
+            n_results=n_resultados
+        )
+        
+        documentos = []
+        for i, doc in enumerate(resultados["documents"][0]):
+            metadatos = resultados["metadatas"][0][i]
+            distancia = resultados["distances"][0][i]
+            documentos.append({
+                "texto": doc,
+                "fuente": metadatos["fuente"],
+                "relevancia": 1 - distancia
+            })
+        
+        return documentos
 
+# Singleton para reutilizar
+_embedder = None
 
-def get_collection_stats() -> Dict[str, Any]:
-    collection = get_or_create_collection()
-    count = collection.count()
-    return {"collection_name": COLLECTION_NAME, "total_chunks": count}
-
-
-if __name__ == "__main__":
-    import sys
-    reset_flag = "--reset" in sys.argv
-    result = index_documents(reset=reset_flag)
-    print(result)
-    print(get_collection_stats())
+def get_embedder():
+    global _embedder
+    if _embedder is None:
+        _embedder = DocumentEmbedder()
+        if _embedder.collection.count() == 0:
+            _embedder.indexar_documentos()
+    return _embedder
