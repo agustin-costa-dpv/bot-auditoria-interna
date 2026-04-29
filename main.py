@@ -12,54 +12,118 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 client = Groq(api_key=GROQ_API_KEY)
-
 app = FastAPI(title="Auditoría Interna Bot")
 
-SYSTEM_PROMPT = """Sos un Auditor Interno Senior con 20 años de experiencia en Auditoría Interna.
-Respondé consultas de empleados del área de Auditoría Interna.
 
-REGLAS ESTRICTAS:
-1. Respondé en español, con tono profesional, claro y paso a paso.
-2. Si la consulta es sobre normativa, procedimientos o controles, explicá detalladamente.
-3. Si no sabés algo con certeza, decí que se debe consultar con el Jefe de Auditoría.
-4. NUNCA digas que sos una IA, un modelo de lenguaje o un bot. Sos parte del equipo de Auditoría Interna.
-5. No inventés datos, montos ni normas específicas que no conozcas.
-6. Si la consulta implica una irregularidad potencial, sé objetivo y orientá al procedimiento formal.
-7. Mantené la confidencialidad.
+def extraer_texto_pdf(ruta, max_paginas=15):
+    """Extrae texto de un PDF, limitado a N páginas."""
+    try:
+        from PyPDF2 import PdfReader
+        reader = PdfReader(ruta)
+        texto = ""
+        for i, pagina in enumerate(reader.pages):
+            if i >= max_paginas:
+                break
+            texto += pagina.extract_text() or ""
+        return texto[:8000]
+    except Exception as e:
+        logger.error(f"Error leyendo {ruta}: {e}")
+        return ""
 
-Para casos concretos, analizá paso a paso: identificá el riesgo, el control, la evidencia necesaria y la conclusión."""
+
+def cargar_documentos():
+    """Carga todos los PDFs de documentos/normativa y documentos/informes."""
+    documentos = {}
+    docs_path = "./documentos"
+
+    if not os.path.exists(docs_path):
+        logger.warning(f"No existe carpeta {docs_path}")
+        return documentos
+
+    for carpeta in ["normativa", "informes"]:
+        carpeta_path = os.path.join(docs_path, carpeta)
+        if not os.path.exists(carpeta_path):
+            continue
+
+        for archivo in os.listdir(carpeta_path):
+            if archivo.endswith(".pdf"):
+                ruta = os.path.join(carpeta_path, archivo)
+                logger.info(f"Extrayendo: {archivo}")
+                texto = extraer_texto_pdf(ruta)
+                if texto.strip():
+                    documentos[archivo] = texto
+                    logger.info(f"  -> {len(texto)} caracteres extraidos")
+
+    logger.info(f"Total documentos cargados: {len(documentos)}")
+    return documentos
+
+
+# Cargar documentos al iniciar
+DOCUMENTOS = cargar_documentos()
+
+SYSTEM_PROMPT_BASE = """Sos un Auditor Interno Senior con 20 anos de experiencia.
+Respondé consultas de empleados del area de Auditoria Interna.
+REGLAS:
+1. Respondé en español, tono profesional, claro y paso a paso.
+2. BASATE UNICAMENTE en la documentacion proporcionada. NO inventes normas.
+3. Citá las fuentes como [Fuente: nombre_del_archivo].
+4. Si la documentacion no alcanza, deci que se debe consultar con el Jefe de Auditoria.
+5. NUNCA digas que sos una IA. Sos parte del equipo de Auditoria Interna.
+6. No inventes datos, montos ni normas especificas que no esten en la documentacion.
+7. Para casos concretos, analizá paso a paso: riesgo, control, evidencia, conclusion."""
+
+
+def construir_prompt(consulta):
+    """Arma el prompt completo con la documentacion."""
+    if not DOCUMENTOS:
+        return SYSTEM_PROMPT_BASE, consulta
+
+    contexto_parts = []
+    for nombre, contenido in DOCUMENTOS.items():
+        resumen = contenido[:2500]
+        contexto_parts.append(f"[Documento: {nombre}]\n{resumen}\n")
+
+    contexto = "\n---\n".join(contexto_parts)
+    system_prompt = SYSTEM_PROMPT_BASE + f"\n\nDOCUMENTACION DISPONIBLE:\n\n{contexto}"
+    return system_prompt, consulta
+
 
 @app.post("/webhook")
 async def webhook(request: Request):
+    """Recibe mensajes de Telegram."""
     try:
         data = await request.json()
-        
+
         if "message" not in data:
             return {"status": "ok"}
-        
+
         message = data["message"]
         chat_id = message["chat"]["id"]
         text = message.get("text", "")
-        
-        # Smalltalk detection
-        smalltalk = ["hola", "buenos días", "buenas tardes", "buenas noches", "hey", "saludos",
-                     "gracias", "muchas gracias", "ok", "okay", "perfecto", "entendido", "dale",
-                     "cómo estás", "qué tal", "todo bien", "/start"]
-        
+
+        # Detectar smalltalk (saludos, gracias, etc.)
+        smalltalk = [
+            "hola", "buenos dias", "buenas tardes", "buenas noches", "hey", "saludos",
+            "gracias", "muchas gracias", "ok", "okay", "perfecto", "entendido", "dale",
+            "como estas", "que tal", "todo bien", "/start"
+        ]
+
         text_lower = text.lower().strip()
-        
+
         if any(s in text_lower for s in smalltalk) and len(text) < 60:
-            reply = "Hola, soy del equipo de Auditoría Interna. ¿En qué puedo ayudarte hoy? Podés consultarme sobre normativas, procedimientos o casos concretos."
+            reply = "Hola, soy del equipo de Auditoria Interna. ¿En que puedo ayudarte hoy? Podes consultarme sobre normativas, procedimientos o casos concretos."
             await send_message(chat_id, reply)
             return {"status": "ok"}
-        
-        # Consulta real -> Groq
+
+        # Consulta real con contexto documental
+        system_prompt, user_query = construir_prompt(text)
+
         try:
             chat_completion = client.chat.completions.create(
                 model="llama-3.1-8b-instant",
                 messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": text}
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": f"Consulta del empleado: {user_query}"}
                 ],
                 temperature=0.3,
                 max_tokens=1500
@@ -67,16 +131,18 @@ async def webhook(request: Request):
             reply = chat_completion.choices[0].message.content.strip()
         except Exception as e:
             logger.error(f"Groq error: {e}")
-            reply = "Disculpá, estoy teniendo dificultades técnicas. Por favor, contactá directamente al equipo de Auditoría."
-        
+            reply = "Disculpa, estoy teniendo dificultades tecnicas. Por favor, contacta directamente al equipo de Auditoria."
+
         await send_message(chat_id, reply)
         return {"status": "ok"}
-        
+
     except Exception as e:
         logger.error(f"Webhook error: {e}")
         return {"status": "error"}
 
+
 async def send_message(chat_id: int, text: str):
+    """Envia mensaje a Telegram."""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     async with httpx.AsyncClient() as client_http:
         await client_http.post(url, json={
@@ -85,6 +151,8 @@ async def send_message(chat_id: int, text: str):
             "parse_mode": "Markdown"
         }, timeout=30.0)
 
+
 @app.get("/health")
 async def health():
-    return {"status": "running"}
+    """Endpoint de salud."""
+    return {"status": "running", "docs_loaded": len(DOCUMENTOS)}
