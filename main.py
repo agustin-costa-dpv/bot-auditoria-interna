@@ -12,11 +12,10 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 client = Groq(api_key=GROQ_API_KEY)
-app = FastAPI(title="Auditoría Interna Bot")
+app = FastAPI(title="Auditoria Interna Bot")
 
 
 def extraer_texto_pdf(ruta, max_paginas=15):
-    """Extrae texto de un PDF, limitado a N páginas."""
     try:
         from PyPDF2 import PdfReader
         reader = PdfReader(ruta)
@@ -32,12 +31,10 @@ def extraer_texto_pdf(ruta, max_paginas=15):
 
 
 def cargar_documentos():
-    """Carga todos los PDFs de documentos/normativa y documentos/informes."""
     documentos = {}
     docs_path = "./documentos"
 
     if not os.path.exists(docs_path):
-        logger.warning(f"No existe carpeta {docs_path}")
         return documentos
 
     for carpeta in ["normativa", "informes"]:
@@ -48,17 +45,14 @@ def cargar_documentos():
         for archivo in os.listdir(carpeta_path):
             if archivo.endswith(".pdf"):
                 ruta = os.path.join(carpeta_path, archivo)
-                logger.info(f"Extrayendo: {archivo}")
                 texto = extraer_texto_pdf(ruta)
                 if texto.strip():
                     documentos[archivo] = texto
-                    logger.info(f"  -> {len(texto)} caracteres extraidos")
 
     logger.info(f"Total documentos cargados: {len(documentos)}")
     return documentos
 
 
-# Cargar documentos al iniciar
 DOCUMENTOS = cargar_documentos()
 
 SYSTEM_PROMPT_BASE = """Sos un Auditor Interno Senior con 20 anos de experiencia.
@@ -73,24 +67,48 @@ REGLAS:
 7. Para casos concretos, analizá paso a paso: riesgo, control, evidencia, conclusion."""
 
 
-def construir_prompt(consulta):
-    """Arma el prompt completo con la documentacion."""
-    if not DOCUMENTOS:
-        return SYSTEM_PROMPT_BASE, consulta
-
-    contexto_parts = []
+def seleccionar_documentos_relevantes(consulta, max_docs=3, max_chars=4000):
+    """
+    Selecciona los documentos mas relevantes basado en palabras clave.
+    """
+    consulta_lower = consulta.lower()
+    palabras_clave = [p for p in consulta_lower.split() if len(p) > 3]
+    
+    scores = []
     for nombre, contenido in DOCUMENTOS.items():
-        resumen = contenido[:2500]
+        score = 0
+        contenido_lower = contenido.lower()
+        
+        # Contar coincidencias de palabras clave
+        for palabra in palabras_clave:
+            if palabra in contenido_lower:
+                score += contenido_lower.count(palabra)
+        
+        # Bonus si el nombre del archivo contiene palabras clave
+        nombre_lower = nombre.lower()
+        for palabra in palabras_clave:
+            if palabra in nombre_lower:
+                score += 10
+        
+        if score > 0:
+            scores.append((nombre, contenido, score))
+    
+    # Ordenar por relevancia y tomar los top N
+    scores.sort(key=lambda x: x[2], reverse=True)
+    seleccionados = scores[:max_docs]
+    
+    # Construir contexto limitado
+    contexto_parts = []
+    for nombre, contenido, _ in seleccionados:
+        # Tomar solo los primeros max_chars caracteres
+        resumen = contenido[:max_chars]
         contexto_parts.append(f"[Documento: {nombre}]\n{resumen}\n")
-
-    contexto = "\n---\n".join(contexto_parts)
-    system_prompt = SYSTEM_PROMPT_BASE + f"\n\nDOCUMENTACION DISPONIBLE:\n\n{contexto}"
-    return system_prompt, consulta
+    
+    return "\n---\n".join(contexto_parts) if contexto_parts else None
 
 
 @app.post("/webhook")
 async def webhook(request: Request):
-    """Recibe mensajes de Telegram."""
     try:
         data = await request.json()
 
@@ -101,7 +119,7 @@ async def webhook(request: Request):
         chat_id = message["chat"]["id"]
         text = message.get("text", "")
 
-        # Detectar smalltalk (saludos, gracias, etc.)
+        # Smalltalk
         smalltalk = [
             "hola", "buenos dias", "buenas tardes", "buenas noches", "hey", "saludos",
             "gracias", "muchas gracias", "ok", "okay", "perfecto", "entendido", "dale",
@@ -115,15 +133,20 @@ async def webhook(request: Request):
             await send_message(chat_id, reply)
             return {"status": "ok"}
 
-        # Consulta real con contexto documental
-        system_prompt, user_query = construir_prompt(text)
+        # Seleccionar documentos relevantes
+        contexto = seleccionar_documentos_relevantes(text)
+        
+        if contexto:
+            system_prompt = SYSTEM_PROMPT_BASE + f"\n\nDOCUMENTACION RELEVANTE:\n\n{contexto}"
+        else:
+            system_prompt = SYSTEM_PROMPT_BASE + "\n\n(No se encontro documentacion especifica para esta consulta. Responde con conocimiento general de auditoria o sugiere escalar.)"
 
         try:
             chat_completion = client.chat.completions.create(
                 model="llama-3.1-8b-instant",
                 messages=[
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": f"Consulta del empleado: {user_query}"}
+                    {"role": "user", "content": f"Consulta del empleado: {text}"}
                 ],
                 temperature=0.3,
                 max_tokens=1500
@@ -142,7 +165,6 @@ async def webhook(request: Request):
 
 
 async def send_message(chat_id: int, text: str):
-    """Envia mensaje a Telegram."""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     async with httpx.AsyncClient() as client_http:
         await client_http.post(url, json={
@@ -154,5 +176,4 @@ async def send_message(chat_id: int, text: str):
 
 @app.get("/health")
 async def health():
-    """Endpoint de salud."""
     return {"status": "running", "docs_loaded": len(DOCUMENTOS)}
